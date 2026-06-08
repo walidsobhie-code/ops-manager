@@ -9,14 +9,18 @@ from prophet import Prophet
 
 logger = logging.getLogger(__name__)
 
+# ── 1. TRAFFIC LIGHTING & STATUSES ───────────────────────────────────────────
 def analyze_store_status(current_value: float, baseline: float) -> str:
+    """Evaluates individual performance boundaries based on historical thresholds."""
     if baseline <= 0: return "Green"
     ratio = current_value / baseline
     if ratio >= 0.90: return "Green"
     elif ratio >= 0.70: return "Yellow"
     else: return "Red"
 
+# ── 2. BASELINE CALCULATION ──────────────────────────────────────────────────
 def calculate_7day_baseline(store_reports: List[Dict[str, Any]]) -> float:
+    """Extracts a 7-day rolling performance target for isolated stores."""
     if not store_reports: return 0.0
     parsed = []
     for r in store_reports:
@@ -36,7 +40,9 @@ def calculate_7day_baseline(store_reports: List[Dict[str, Any]]) -> float:
         return round(sum(all_sales) / len(all_sales), 2) if all_sales else 0.0
     return round(sum(recent_sales) / len(recent_sales), 2)
 
+# ── 3. OPERATIONAL RISK FLAGS ────────────────────────────────────────────────
 def identify_red_zone_stores(today_reports, baselines, threshold_pct=30.0):
+    """Filters store instances reporting immediate operational degradation."""
     red_zone = []
     for report in today_reports:
         store_id = report.get("store_id")
@@ -46,18 +52,28 @@ def identify_red_zone_stores(today_reports, baselines, threshold_pct=30.0):
         if baseline <= 0: continue
         drop_pct = (baseline - current) / baseline * 100
         if drop_pct >= threshold_pct:
-            red_zone.append({"store_id": store_id, "current_value": round(current, 2), "baseline": round(baseline, 2), "drop_pct": round(drop_pct, 1)})
+            red_zone.append({
+                "store_id": store_id, 
+                "current_value": round(current, 2), 
+                "baseline": round(baseline, 2), 
+                "drop_pct": round(drop_pct, 1)
+            })
     red_zone.sort(key=lambda x: x["drop_pct"], reverse=True)
     return red_zone
 
+# ── 4. AGENT LLM GENERATORS ──────────────────────────────────────────────────
 def generate_fleet_summary_prompt(recent_reports):
-    if not recent_reports: return 'Return this exact JSON: {"fleet_health_score": 0, "strategic_recommendation": "No data available.", "critical_alerts": [], "top_performer": "", "at_risk_stores": []}'
+    """Encapsulates telemetry state into strict prompt contracts for local/cloud LLMs."""
+    if not recent_reports: 
+        return 'Return this exact JSON: {"fleet_health_score": 0, "strategic_recommendation": "No data available.", "critical_alerts": [], "top_performer": "", "at_risk_stores": []}'
     store_lines = [f"  • {r.get('store_id', 'Unknown')}: sales=${r.get('sales', 0)}, inventory={r.get('inventory_status', 'unknown')}, staffing={r.get('staffing', 'unknown')}" for r in recent_reports]
     stores_block = "\n".join(store_lines)
     report_date = recent_reports[0].get("report_date", "today")
     return f"You are the AI operations brain. Analyse reports for {report_date}:\n{stores_block}\nReturn ONLY JSON: {{\"fleet_health_score\": int, \"strategic_recommendation\": str, \"critical_alerts\": [], \"top_performer\": str, \"at_risk_stores\": []}}"
 
+# ── 5. CORE KPI COMPILATIONS ──────────────────────────────────────────────────
 def calculate_fleet_kpis(all_reports):
+    """Calculates summary parameters across all active fleet metrics."""
     if not all_reports: return {"total_sales": 0.0, "avg_sales": 0.0, "store_count": 0, "report_count": 0, "top_store": "—", "top_sales": 0.0}
     store_totals = {}
     for r in all_reports:
@@ -66,13 +82,23 @@ def calculate_fleet_kpis(all_reports):
     total_sales = sum(store_totals.values())
     store_count = len(store_totals)
     top_store = max(store_totals, key=store_totals.get) if store_totals else "—"
-    return {"total_sales": round(total_sales, 2), "avg_sales": round(total_sales/store_count, 2) if store_count else 0.0, "store_count": store_count, "report_count": len(all_reports), "top_store": top_store, "top_sales": round(store_totals.get(top_store, 0), 2)}
+    return {
+        "total_sales": round(total_sales, 2), 
+        "avg_sales": round(total_sales/store_count, 2) if store_count else 0.0, 
+        "store_count": store_count, 
+        "report_count": len(all_reports), 
+        "top_store": top_store, 
+        "top_sales": round(store_totals.get(top_store, 0), 2)
+    }
 
+# ── 6. PROPHET DEMAND FORECASTING ────────────────────────────────────────────
 def generate_store_forecast(store_reports, periods=7):
+    """Applies Facebook Prophet to extrapolate temporal store traffic trends."""
     if not store_reports: return {"forecast": [], "trend": "stable"}
     data = [{"ds": (r.get("report_date").split("T")[0] if isinstance(r.get("report_date"), str) else r.get("report_date")), "y": float(r.get("sales") or 0)} for r in store_reports]
     df_p = pd.DataFrame(data)
     if len(df_p) < 2: return {"forecast": [], "trend": "insufficient_data"}
+    
     m = Prophet(daily_seasonality=True, yearly_seasonality=False, weekly_seasonality=True)
     m.fit(df_p)
     future = m.make_future_dataframe(periods=periods)
@@ -81,7 +107,9 @@ def generate_store_forecast(store_reports, periods=7):
     trend = "increasing" if res[-1]['yhat'] > res[0]['yhat'] else "decreasing"
     return {"forecast": res, "trend": trend}
 
+# ── 7. STATISTICAL OUTLIER ANALYSIS ──────────────────────────────────────────
 def calculate_store_benchmarks(all_reports):
+    """Applies SciPy Z-Score normalization to uncover extreme performance fluctuations."""
     if not all_reports: return []
     latest_sales = {r.get("store_id"): float(r.get("sales") or 0) for r in all_reports if r.get("store_id")}
     vals = list(latest_sales.values())
@@ -97,6 +125,7 @@ def calculate_store_benchmarks(all_reports):
     bench.sort(key=lambda x: x['z_score'])
     return bench
 
+# ── 8. REPORT GENERATION ENGINE ──────────────────────────────────────────────
 def export_fleet_to_excel(df, output_path="fleet_report.xlsx"):
     import openpyxl
     from openpyxl.styles import Font, PatternFill
@@ -116,7 +145,9 @@ def export_fleet_to_pdf(df, output_path="fleet_report.pdf"):
     HTML(string=html).write_pdf(output_path)
     return output_path
 
+# ── 9. RESOURCE OPTIMIZATION CORE ────────────────────────────────────────────
 def optimize_staffing(store_id, required_hours, available_staff):
+    """Uses Google OR-Tools to solve explicit shift scheduling tasks constraint equations."""
     from ortools.sat.python import cp_model
     model = cp_model.CpModel()
     staff_vars = {i: model.NewIntVar(0, s.get("max_hours", 8), f"s{i}") for i, s in enumerate(available_staff)}
