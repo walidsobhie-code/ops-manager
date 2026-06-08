@@ -1,319 +1,429 @@
-import os
-import signal
+"""
+brain/analytics.py
+──────────────────
+Pure-Python analytics helpers for OPS NEXUS dashboard.
+Core API has no external dependencies beyond the stdlib. 
+Heavy components (Prophet, Scipy, openpyxl, WeasyPrint, OR-Tools) 
+use dynamic imports to keep deployment fast and flexible.
+
+Public API
+----------
+analyze_store_status(current_value, baseline)            -> str  "Green" | "Yellow" | "Red"
+calculate_7day_baseline(store_reports)                   -> float
+identify_red_zone_stores(today_reports, baselines)       -> list[dict]
+generate_fleet_summary_prompt(recent_reports)            -> str
+calculate_fleet_kpis(all_reports)                        -> dict
+generate_store_forecast(store_reports, periods=7)        -> dict
+calculate_store_benchmarks(all_reports)                  -> list[dict]
+export_fleet_to_excel(df, output_path)                   -> str
+export_fleet_to_pdf(df, output_path)                     -> str
+optimize_staffing(store_id, req_hours, available_staff)  -> dict
+"""
+
+from __future__ import annotations
+
 import logging
-import asyncio
-from fastapi import FastAPI, Request, Response, HTTPException, status
-from fastapi.responses import HTMLResponse
-import uvicorn
-from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
-from telegram.request import HTTPXRequest
-from brain.ops_brain import OpsManagerAI
-from brain.db_handler import StoreDB
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
 
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
 logger = logging.getLogger(__name__)
-logging.getLogger("httpx").setLevel(logging.WARNING)  # Suppress URLs containing bot token
 
-def get_required_env(var_name: str) -> str:
-    value = os.getenv(var_name)
-    if not value or not value.strip():
-        raise RuntimeError(f"Missing environment variable: '{var_name}'")
-    return value
 
-TELEGRAM_TOKEN   = get_required_env("TELEGRAM_TOKEN")
-GROQ_API_KEY     = get_required_env("GROQ_API_KEY")
-SUPABASE_URL     = get_required_env("SUPABASE_URL")
-SUPABASE_KEY     = get_required_env("SUPABASE_KEY")
-WEBHOOK_SECRET   = get_required_env("WEBHOOK_SECRET")
-SPACE_URL        = get_required_env("SPACE_URL")
-
-WEBHOOK_PATH     = "/telegram-webhook"
-WEBHOOK_URL      = f"{SPACE_URL.rstrip('/')}{WEBHOOK_PATH}"
-
-ai_manager = None
-db = None
-bot_app = None
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-async def safe_reply(message, text: str) -> None:
-    """Send a reply, silently swallowing network timeouts so the handler never crashes."""
-    try:
-        await message.reply_text(text)
-    except Exception as e:
-        logger.warning(f"safe_reply: could not deliver message to user: {e}")
-
-# ---------------------------------------------------------------------------
-# Telegram message handler
-# ---------------------------------------------------------------------------
-
-async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.voice:
-        return
-
-    user = update.message.from_user
-    user_name = user.first_name if user else "Staff"
-    logger.info(f"Processing voice memo from {user_name}")
-
-    try:
-        # 1. Download voice file
-        voice_file = await update.message.voice.get_file()
-        file_path = f"voice_{update.message.message_id}.ogg"
-        await voice_file.download_to_drive(file_path)
-
-        # 2. Transcription (Whisper API)
-        import openai
-        client = openai.OpenAI()
-        audio_file = open(file_path, "rb")
-        transcription = client.audio.transcriptions.create(
-            model="whisper-1", 
-            file=audio_file
-        ).text
-
-        # 3. Structure data via Groq
-        structured_data = ai_manager.process_voice_memo(transcription)
-
-        if not structured_data or not structured_data.get('store_id'):
-            await safe_reply(
-                update.message, 
-                "⚠️ I received your voice note, but couldn't identify the store. Please try again or text the report."
-            )
-            return
-
-        db.save_report(structured_data)
-        await safe_reply(
-            update.message, 
-            f"✅ Voice report processed for {structured_data.get('store_id')}.\\n\\n"
-            f"Transcription: {transcription}\\n\\n"
-            f"Analysis: {structured_data.get('analysis', 'N/A')}\\n\\n"
-            f"Logged to Dashboard."
-        )
-        
-        # Cleanup
-        os.remove(file_path)
-
-    except Exception as e:
-        logger.error(f"Voice memo error: {e}")
-        await safe_reply(update.message, "❌ Failed to process voice memo. Ensure OpenAI key is configured.")
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-
-    text = update.message.text.strip()
-    if not text:
-        return
-
-    user = update.message.from_user
-    user_name = user.first_name if user else "Staff"
-    logger.info(f"Processing report from {user_name}")
-
-    try:
-        structured_data = ai_manager.process_telegram_message(text)
-
-        if not structured_data or not structured_data.get('store_id'):
-            await safe_reply(
-                update.message,
-                "⚠️ I couldn't extract a valid Store ID. Please mention your store location clearly."
-            )
-            return
-
-        db.save_report(structured_data)
-        await safe_reply(
-            update.message,
-            f"✅ Report successfully received for {structured_data.get('store_id')}.\\n\\n"
-            f"Analysis Summary:\\n{structured_data.get('analysis', 'N/A')}\\n\\n"
-            f"Actions logged to Live Dashboard."
-        )
-
-    except Exception as e:
-        logger.error(f"Error in execution handler: {e}")
-        await safe_reply(update.message, "❌ An error occurred while saving your report parameters.")
-
-# ---------------------------------------------------------------------------
-# FastAPI app
-# ---------------------------------------------------------------------------
-
-app = FastAPI(title="Sovereign Ops Heartbeat Engine")
-
-@app.head("/")
-async def head_root():
-    return Response(status_code=status.HTTP_200_OK)
-
-@app.get("/", response_class=HTMLResponse)
-async def root():
-    bot_status = "Webhook Active" if (ai_manager and db and bot_app) else "Booting"
-    return f"""
-    <!DOCTYPE html>
-    <html style="background:#03050a;color:#cbd5e1;font-family:sans-serif;">
-        <head><title>Sovereign Ops</title></head>
-        <body style="display:flex;justify-content:center;align-items:center;height:100vh;margin:0;">
-            <div style="background:rgba(10,14,26,0.8);border:1px solid rgba(255,255,255,0.05);padding:32px;border-radius:12px;text-align:center;">
-                <h1 style="color:#3b82f6;">◈ SOVEREIGN OPS MANAGER ◈</h1>
-                <p>Status: <span style="background:rgba(16,185,129,0.08);color:#10b981;border:1px solid rgba(16,185,129,0.2);padding:4px 12px;border-radius:6px;font-weight:bold;">Online & Healthy</span></p>
-                <p>Pipeline Engine: <span style="color:#e2e8f0;">{bot_status}</span></p>
-            </div
-        </body
-    </html
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. analyze_store_status
+# ─────────────────────────────────────────────────────────────────────────────
+def analyze_store_status(current_value: float, baseline: float) -> str:
     """
+    Compare today's sales against the 7-day rolling baseline and return a
+    traffic-light status string.
 
-@app.get("/health")
-async def health():
+    Thresholds
+    ----------
+    Green  : current >= 90 % of baseline  (on target or above)
+    Yellow : 70 % <= current < 90 %       (mild underperformance)
+    Red    : current < 70 % of baseline   (significant drop)
+
+    If baseline is 0 (new store / no history), returns "Green" to avoid
+    false alarms.
+    """
+    if baseline <= 0:
+        return "Green"
+
+    ratio = current_value / baseline
+
+    if ratio >= 0.90:
+        return "Green"
+    elif ratio >= 0.70:
+        return "Yellow"
+    else:
+        return "Red"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. calculate_7day_baseline
+# ─────────────────────────────────────────────────────────────────────────────
+def calculate_7day_baseline(store_reports: List[Dict[str, Any]]) -> float:
+    """
+    Calculate a rolling 7-day average sales baseline for a single store.
+
+    Parameters
+    ----------
+    store_reports : list of report dicts, each containing at minimum:
+        - 'report_date'  : str (ISO "YYYY-MM-DD") or datetime / date object
+        - 'sales'        : numeric or str-numeric
+
+    Returns
+    -------
+    float  — average daily sales over the most recent 7 calendar days
+             that have at least one report; 0.0 if no valid data.
+    """
+    if not store_reports:
+        return 0.0
+
+    # Normalise dates and sales
+    parsed: List[tuple[datetime, float]] = []
+    for r in store_reports:
+        try:
+            raw_date = r.get("report_date")
+            if isinstance(raw_date, str):
+                raw_date = datetime.fromisoformat(raw_date.split("T")[0])
+            elif hasattr(raw_date, "date"):          # datetime / pandas Timestamp
+                raw_date = raw_date                  # already datetime-like
+            sales = float(r.get("sales") or 0)
+            parsed.append((raw_date, sales))
+        except (TypeError, ValueError):
+            continue
+
+    if not parsed:
+        return 0.0
+
+    # Find the most recent date in the dataset
+    most_recent = max(d for d, _ in parsed)
+    cutoff      = most_recent - timedelta(days=6)   # last 7 days inclusive
+
+    recent_sales = [s for d, s in parsed if d >= cutoff and s > 0]
+
+    if not recent_sales:
+        # Fall back to all-time average if last 7 days are empty
+        all_sales = [s for _, s in parsed if s > 0]
+        return round(sum(all_sales) / len(all_sales), 2) if all_sales else 0.0
+
+    return round(sum(recent_sales) / len(recent_sales), 2)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. identify_red_zone_stores
+# ─────────────────────────────────────────────────────────────────────────────
+def identify_red_zone_stores(
+    today_reports: List[Dict[str, Any]],
+    baselines: Dict[str, float],
+    threshold_pct: float = 30.0,
+) -> List[Dict[str, Any]]:
+    """
+    Identify stores whose current sales are below their baseline by at least
+    `threshold_pct` percent.
+    """
+    red_zone: List[Dict[str, Any]] = []
+
+    for report in today_reports:
+        store_id = report.get("store_id")
+        if not store_id:
+            continue
+
+        current = float(report.get("sales") or 0)
+        baseline = baselines.get(store_id, 0.0)
+
+        if baseline <= 0:
+            continue
+
+        drop_pct = (baseline - current) / baseline * 100
+
+        if drop_pct >= threshold_pct:
+            red_zone.append({
+                "store_id":      store_id,
+                "current_value": round(current, 2),
+                "baseline":      round(baseline, 2),
+                "drop_pct":      round(drop_pct, 1),
+            })
+
+    red_zone.sort(key=lambda x: x["drop_pct"], reverse=True)
+    return red_zone
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. generate_fleet_summary_prompt
+# ─────────────────────────────────────────────────────────────────────────────
+def generate_fleet_summary_prompt(recent_reports: List[Dict[str, Any]]) -> str:
+    """
+    Build a structured prompt for the Groq AI fleet intelligence banner.
+    """
+    if not recent_reports:
+        return (
+            'Return this exact JSON: {"fleet_health_score": 0, '
+            '"strategic_recommendation": "No data available.", '
+            '"critical_alerts": [], "top_performer": "", "at_risk_stores": []}'
+        )
+
+    store_lines: List[str] = []
+    for r in recent_reports:
+        store_id  = r.get("store_id", "Unknown")
+        sales     = r.get("sales", 0)
+        inventory = r.get("inventory_status", "unknown")
+        staffing  = r.get("staffing", "unknown")
+        analysis  = r.get("analysis", "")
+        store_lines.append(
+            f"  • {store_id}: sales=${sales}, inventory={inventory}, "
+            f"staffing={staffing}, AI note={analysis}"
+        )
+
+    stores_block = "\n".join(store_lines)
+    report_date  = recent_reports[0].get("report_date", "today")
+
+    prompt = f"""You are the AI operations brain for a multi-store retail fleet.
+Analyse the latest daily report data below and return a JSON object — nothing else.
+
+REPORT DATE: {report_date}
+STORES ({len(recent_reports)} total):
+{stores_block}
+
+Return ONLY valid JSON matching this exact schema (no markdown, no preamble):
+{{
+  "fleet_health_score": <integer 0-100, where 100 = all stores exceeding targets>,
+  "strategic_recommendation": "<one clear, actionable sentence for the ops manager>",
+  "critical_alerts": ["<alert 1>", "<alert 2>"],
+  "top_performer": "<store_id of best performing store>",
+  "at_risk_stores": ["<store_id>", ...]
+}}
+
+Scoring guide:
+- 90-100 : All stores ≥ target, no inventory or staffing issues
+- 70-89  : Minor shortfalls in 1-2 stores
+- 50-69  : Multiple stores underperforming or staffing gaps
+- 30-49  : Significant revenue decline across fleet
+- 0-29   : Critical — multiple stores in crisis
+"""
+    return prompt
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. calculate_fleet_kpis
+# ─────────────────────────────────────────────────────────────────────────────
+def calculate_fleet_kpis(all_reports: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Calculate top-level fleet KPIs from the full report dataset.
+    """
+    if not all_reports:
+        return {
+            "total_sales":  0.0,
+            "avg_sales":    0.0,
+            "store_count":  0,
+            "report_count": 0,
+            "top_store":    "—",
+            "top_sales":    0.0,
+        }
+
+    store_totals: Dict[str, float] = {}
+    for r in all_reports:
+        sid   = r.get("store_id", "Unknown")
+        sales = float(r.get("sales") or 0)
+        store_totals[sid] = store_totals.get(sid, 0.0) + sales
+
+    total_sales  = sum(store_totals.values())
+    store_count  = len(store_totals)
+    avg_sales    = round(total_sales / store_count, 2) if store_count else 0.0
+    top_store    = max(store_totals, key=store_totals.get) if store_totals else "—"
+    top_sales    = store_totals.get(top_store, 0.0)
+
     return {
-        "status": "ok" if (ai_manager and db and bot_app) else "initializing",
-        "ai_service": bool(ai_manager),
-        "db_connection": bool(db),
-        "bot_active": bool(bot_app),
-        "mode": "webhook",
-        "pending_reports": db.pending_count() if db else -1,
+        "total_sales":  round(total_sales, 2),
+        "avg_sales":    avg_sales,
+        "store_count":  store_count,
+        "report_count": len(all_reports),
+        "top_store":    top_store,
+        "top_sales":    round(top_sales, 2),
     }
 
-@app.post(WEBHOOK_PATH)
-async def telegram_webhook(request: Request):
-    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-    if secret != WEBHOOK_SECRET:
-        logger.warning("Webhook received with invalid secret token.")
-        raise HTTPException(status_code=403, detail="Forbidden")
 
-    if not bot_app:
-        logger.warning("Webhook hit before bot_app is ready.")
-        raise HTTPException(status_code=503, detail="Bot not ready yet")
-
-    data = await request.json()
-    update = Update.de_json(data, bot_app.bot)
-    await bot_app.process_update(update)
-    return {"ok": True}
-
-# ---------------------------------------------------------------------------
-# Bot initialisation — single attempt, cleans up on failure
-# ---------------------------------------------------------------------------
-
-async def _init_bot():
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. generate_store_forecast (Prophet)
+# ─────────────────────────────────────────────────────────────────────────────
+def generate_store_forecast(store_reports: List[Dict[str, Any]], periods: int = 7) -> Dict[str, Any]:
     """
-    Build a fresh Application instance with generous timeouts, initialise it,
-    and register the webhook. On any failure, gracefully shut down the partial
-    instance so no lingering connections block the next retry.
+    Predict future sales using Facebook Prophet. Safe dynamic import.
     """
-    global bot_app
+    try:
+        from prophet import Prophet
+        import pandas as pd
+    except ImportError:
+        logger.warning("Prophet or Pandas not installed. Forecasting disabled.")
+        return {"forecast": [], "trend": "library_missing"}
+        
+    if not store_reports:
+        return {"forecast": [], "trend": "stable"}
 
-    request_client = HTTPXRequest(
-        connect_timeout=20.0,
-        read_timeout=20.0,
-    )
-
-    app_instance = (
-        ApplicationBuilder()
-        .token(TELEGRAM_TOKEN)
-        .request(request_client)
-        .updater(None)
-        .build()
-    )
+    data = []
+    for r in store_reports:
+        date = r.get("report_date")
+        if isinstance(date, str):
+            date = date.split("T")[0]
+        data.append({"ds": date, "y": float(r.get("sales") or 0)})
     
-    app_instance.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    app_instance.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
+    df_prophet = pd.DataFrame(data)
+    if len(df_prophet) < 2:
+        return {"forecast": [], "trend": "insufficient_data"}
 
+    model = Prophet(daily_seasonality=True, yearly_seasonality=False, weekly_seasonality=True)
+    model.fit(df_prophet)
+    
+    future = model.make_future_dataframe(periods=periods)
+    forecast = model.predict(future)
+    
+    result = forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].tail(periods).to_dict('records')
+    trend = "increasing" if result[-1]['yhat'] > result[0]['yhat'] else "decreasing"
+    
+    return {"forecast": result, "trend": trend}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. calculate_store_benchmarks (Z-Score)
+# ─────────────────────────────────────────────────────────────────────────────
+def calculate_store_benchmarks(all_reports: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Perform store-to-store benchmarking using Z-scores to find outliers. Safe dynamic import.
+    """
     try:
-        logger.info("Step 1/3: Initializing app instance...")
-        await app_instance.initialize()
-        logger.info("Step 1/3: Initialization complete.")
+        from scipy import stats
+    except ImportError:
+        logger.warning("Scipy not installed. Benchmarking disabled.")
+        return []
+        
+    if not all_reports:
+        return []
 
-        logger.info("Step 2/3: Starting app instance...")
-        await app_instance.start()
-        logger.info("Step 2/3: Start complete.")
+    latest_sales = {}
+    for r in all_reports:
+        sid = r.get("store_id")
+        latest_sales[sid] = float(r.get("sales") or 0)
+    
+    sales_values = list(latest_sales.values())
+    if len(sales_values) < 2:
+        return []
 
-        logger.info(f"Step 3/3: Registering webhook → {WEBHOOK_URL}")
-        await app_instance.bot.set_webhook(
-            url=WEBHOOK_URL,
-            secret_token=WEBHOOK_SECRET,
-            drop_pending_updates=True,
-        )
-        logger.info("Step 3/3: Webhook registration complete.")
+    z_scores = stats.zscore(sales_values)
+    
+    benchmarks = []
+    for i, (sid, val) in enumerate(latest_sales.items()):
+        z = z_scores[i]
+        significance = "Neutral"
+        if z > 1.5: significance = "High Outlier (Positive)"
+        elif z < -1.5: significance = "Critical Underperformer"
+        
+        benchmarks.append({
+            "store_id": sid,
+            "sales": val,
+            "z_score": round(z, 2),
+            "significance": significance
+        })
+    
+    benchmarks.sort(key=lambda x: x['z_score'])
+    return benchmarks
 
-        bot_app = app_instance
 
-    except Exception:
-        try:
-            await app_instance.stop()
-        except Exception:
-            pass
-        try:
-            await app_instance.shutdown()
-        except Exception:
-            pass
-        raise
-
-# ---------------------------------------------------------------------------
-# Bot pipeline with retry loop
-# ---------------------------------------------------------------------------
-
-async def start_webhook_pipeline():
-    global ai_manager, db
-
-    await asyncio.sleep(2.0)
-
-    logger.info("⚙️ Initializing Core AI and Database engines...")
-    ai_manager = OpsManagerAI(api_key=GROQ_API_KEY)
-    db = StoreDB(url=SUPABASE_URL, key=SUPABASE_KEY)
-
-    max_attempts = 10
-    retry_delay  = 30
-
-    for attempt in range(1, max_attempts + 1):
-        logger.info(f"🤖 Building Telegram bot application (attempt {attempt}/{max_attempts})...")
-        try:
-            await _init_bot()
-            logger.info("🚀 Webhook registered. System is live and monitoring operational channels.")
-            return
-        except Exception as e:
-            logger.warning(f"Bot init attempt {attempt}/{max_attempts} failed: {e}")
-            if attempt < max_attempts:
-                logger.info(f"Retrying in {retry_delay}s...")
-                await asyncio.sleep(retry_delay)
-
-    logger.error("❌ Bot failed to initialize after all attempts. FastAPI health server still running.")
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-async def main():
-    stop_event = asyncio.Event()
-
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, lambda: stop_event.set())
-        except NotImplementedError:
-            pass
-
-    config = uvicorn.Config(app, host="0.0.0.0", port=7860, log_level="info")
-    server = uvicorn.Server(config)
-    server_task = asyncio.create_task(server.serve())
-    logger.info("HF Heartbeat Web Server initialized onto port 7860.")
-
-    asyncio.create_task(start_webhook_pipeline())
-
-    await stop_event.wait()
-
-    logger.info("Termination intercept caught. Initiating clean application teardown...")
-    server.should_exit = True
-    await server_task
-
-    if bot_app:
-        await bot_app.bot.delete_webhook()
-        await bot_app.stop()
-        await bot_app.shutdown()
-
-    logger.info("Sovereign execution loop successfully finalized. Machine offline.")
-
-if __name__ == "__main__":
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. export_to_excel
+# ─────────────────────────────────────────────────────────────────────────────
+def export_fleet_to_excel(df: Any, output_path: str = "fleet_report.xlsx") -> str:
+    """
+    Exports current fleet dataframe to a formatted Excel file. Safe dynamic import.
+    """
     try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Process offline.")
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill
+    except ImportError:
+        logger.warning("openpyxl not installed. Excel export fallback to CSV.")
+        csv_path = output_path.replace(".xlsx", ".csv")
+        df.to_csv(csv_path, index=False)
+        return csv_path
+
+    df.to_excel(output_path, index=False, sheet_name="Ops Report")
+    wb = openpyxl.load_workbook(output_path)
+    ws = wb.active
+    
+    header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True)
+    
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        
+    wb.save(output_path)
+    return output_path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. export_to_pdf
+# ─────────────────────────────────────────────────────────────────────────────
+def export_fleet_to_pdf(df: Any, output_path: str = "fleet_report.pdf") -> str:
+    """
+    Converts a simple HTML summary table to PDF. Safe dynamic import.
+    """
+    try:
+        from weasyprint import HTML
+    except ImportError:
+        logger.warning("weasyprint not installed. PDF export skipped.")
+        return ""
+
+    html_content = f"""
+    <html>
+    <style>
+        body {{ font-family: Arial, sans-serif; color: #333; }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 20px; }}
+        th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+        th {{ background-color: #f2f2f2; }}
+        h1 {{ color: #1f4e78; }}
+    </style>
+    <body>
+        <h1>Sovereign Ops Fleet Report</h1>
+        <p>Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
+        {df.to_html(index=False)}
+    </body>
+    </html>
+    """
+    HTML(string=html_content).write_pdf(output_path)
+    return output_path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. optimize_staffing (OR-Tools)
+# ─────────────────────────────────────────────────────────────────────────────
+def optimize_staffing(store_id: str, required_hours: int, available_staff: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Simple constraint solver to allocate shifts given available staff and total hour requirements.
+    """
+    try:
+        from ortools.sat.python import cp_model
+    except ImportError:
+        logger.warning("ortools not installed. Staff optimization skipped.")
+        return {"status": "library_missing", "schedule": []}
+
+    model = cp_model.CpModel()
+    
+    staff_vars = {}
+    for i, s in enumerate(available_staff):
+        staff_vars[i] = model.NewIntVar(0, s.get("max_hours", 8), f"staff_{i}")
+    
+    model.Add(sum(staff_vars.values()) == required_hours)
+    
+    solver = cp_model.CpSolver()
+    status = solver.Solve()
+    
+    if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+        schedule = []
+        for i, s in enumerate(available_staff):
+            schedule.append({
+                "name": s.get("name", f"Staff {i}"),
+                "assigned_hours": solver.Value(staff_vars[i])
+            })
+        return {"status": "success", "schedule": schedule}
+    
+    return {"status": "infeasible", "schedule": []}
