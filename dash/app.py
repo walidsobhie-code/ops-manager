@@ -1,5 +1,6 @@
 import sys
 import os
+import json  # Fixed: Added missing module import for handling Groq AI JSON conversions
 from pathlib import Path
 
 # ── Path bootstrap ──────────────────────────────────────────────────────────────
@@ -15,6 +16,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from brain.db_handler import StoreDB
 from brain.ops_brain import OpsManagerAI
+
 try:
     from brain.analytics import (
         analyze_store_status, 
@@ -49,6 +51,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
+
 # --- State Initialization ---
 @st.cache_resource
 def init_services():
@@ -61,7 +64,8 @@ db, ai = init_services()
 
 st.title("◈ SOVEREIGN OPS COMMAND CENTER ◈")
 
-# 1. Data Fetching
+
+# --- 1. Data Fetching ---
 all_data = db.get_all_store_summaries()
 df = pd.DataFrame(all_data.data)
 
@@ -78,7 +82,8 @@ for store in df['store_id'].unique():
     store_reports = df[df['store_id'] == store].to_dict('records')
     baselines[store] = calculate_7day_baseline(store_reports)
 
-# --- 3-TIER HIERARCHY ---
+
+# ─── 3-TIER HIERARCHY ───────────────────────────────────────────────────────────
 
 # TIER 1: EXECUTIVE PULSE
 st.markdown("### 📡 EXECUTIVE PULSE")
@@ -112,7 +117,8 @@ with st.container():
 
 st.markdown("<br>", unsafe_allow_html=True)
 
-# TIER 2: TACTICAL HEATMAP & CALENDAR
+
+# TIER 2: TACTICAL HEATMAP & SIDE PANEL
 col_main, col_side = st.columns([3, 1])
 
 with col_main:
@@ -137,7 +143,7 @@ with col_main:
                          template="plotly_dark",
                          size_max=60)
         fig.update_layout(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)')
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")  # Fixed: Replaced deprecated use_container_width
     
     with tabs[1]:
         st.subheader("Daily Performance Log")
@@ -152,7 +158,7 @@ with col_main:
         trend_fig = px.line(df, x='report_date', y='sales', color='store_id', 
                            template="plotly_dark", markers=True)
         trend_fig.update_layout(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)')
-        st.plotly_chart(trend_fig, use_container_width=True)
+        st.plotly_chart(trend_fig, width="stretch")  # Fixed: Replaced deprecated use_container_width
 
     with tabs[3]:
         st.subheader("🔮 Sales Forecasting")
@@ -170,7 +176,7 @@ with col_main:
             fig_f = px.line(f_df, x='ds', y='yhat', labels={'yhat': 'Predicted Sales'}, 
                              template="plotly_dark", title=f"Forecast for {f_store}")
             fig_f.update_layout(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)')
-            st.plotly_chart(fig_f, use_container_width=True)
+            st.plotly_chart(fig_f, width="stretch")  # Fixed: Replaced deprecated use_container_width
 
     with tabs[4]:
         st.subheader("⚖️ Store-to-Store Benchmarking")
@@ -219,11 +225,12 @@ with col_side:
                     <strong style="color:#fff">{store['store_id']}</strong><br>
                     <span style="font-size:1.2rem; font-weight:bold;">↓ {store['drop_pct']}%</span><br>
                     <span style="font-size:0.8rem;">Val: {store['current_value']} | Base: {store['baseline']}</span>
-                </div
-            """, unsafe_allow_html=True)
+                </div>
+            """, unsafe_allow_html=True)  # Fixed: Sealed malformed unclosed </div> tag
             if st.button(f"Contact {store['store_id']}", key=f"btn_{store['store_id']}"):
                 st.info(f"Bridge established. Sending alert to {store['store_id']} manager...")
 
+# --- TIER 3: EXPORT SUITE (SIDEBAR) ---
 st.sidebar.markdown("### 📤 EXPORT SUITE")
 if st.sidebar.button("Export to Excel (.xlsx)"):
     try:
