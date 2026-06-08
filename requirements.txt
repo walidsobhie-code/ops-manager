@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+python-telegram-bot
+httpx
+pandas
+supabase
+groq
+streamlit
+plotly
+nbformat
+prophet
+scipy
+weasyprint
+openpyxl
+openai
+ortools

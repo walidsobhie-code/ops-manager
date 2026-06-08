@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+import os
+import sys
+import json
+import requests
+import click
+import subprocess
+from datetime import datetime
+from typing import Optional, Dict, Any
+from rich.console import Console
+from rich.panel import Panel
+from rich.prompt import Prompt
+
+# --- CONFIGURATION ---
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:31b-cloud")
+MEMORY_FILE = os.path.expanduser("~/.nexus_memory.json")
+
+# HARD-ANCHORED IDENTITY LOCK - NO LINUX HALLUCINATIONS
+IDENTITY_LOCK = (
+    "SYSTEM IDENTITY: You are HERMES, a local sovereign agent. "
+    f"RUNTIME: Ollama (Model: {OLLAMA_MODEL}). "
+    "OS ENVIRONMENT: macOS (Apple Silicon/Intel). DO NOT use Linux-specific commands. "
+    "FORBIDDEN: No 'apt-get', no '/proc/', no '/sys/', no 'free -m', no 'systemctl'. "
+    "REQUIRED MAC TOOLS: Use 'vm_stat', 'top', 'sysctl', 'purge', 'ps', 'osascript'. "
+    "SOP: You are a SYSTEM OPERATOR. provide the RESULT, not the code. "
+    "Wrap bash commands in ```bash\ncommand\n```."
+)
+
+GUILD = {
+    "SEC": {"name": "Security Guard", "color": "red", "prompt": "SecOps Specialist. macOS hardening and risk analysis. No fluff."},
+    "DEV": {"name": "Dev Architect", "color": "blue", "prompt": "Software Architect. macOS environment and clean implementation. No resumes."},
+    "SYS": {"name": "System Optimizer", "color": "green", "prompt": "SysAdmin. macOS kernel, RAM, and thermal analysis. Direct and technical."},
+    "PILOT": {"name": "The Pilot", "color": "yellow", "prompt": "UI/UX Operator. macOS accessibility and visual navigation."},
+    "BRAIN": {"name": "The Strategist", "color": "cyan", "prompt": "Chief Architect. Define strict macOS-specific execution plans. Roadmap only."},
+    "MANAGER": {"name": "The Auditor", "color": "magenta", "prompt": "Quality Controller. Audit execution against goal. VERIFIED or ERRORS."}
+}
+
+console = Console()
+
+class NexusMemory:
+    def __init__(self, path: str):
+        self.path = path
+        self.data = self._load()
+
+    def _load(self):
+        if os.path.exists(self.path):
+            with open(self.path, 'r') as f:
+                return json.load(f)
+        return {"history": [], "preferences": {}}
+
+    def save_action(self, task: str, action: str, result: str):
+        entry = {"timestamp": datetime.now().isoformat(), "task": task, "action": action, "result": result}
+        self.data["history"].append(entry)
+        with open(self.path, 'w') as f:
+            json.dump(self.data, f, indent=2)
+
+class NexusEngine:
+    def __init__(self):
+        self.memory = NexusMemory(MEMORY_FILE)
+
+    def execute_command(self, command: str) -> str:
+        try:
+            process = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=60)
+            return f"STDOUT: {process.stdout}\nSTDERR: {process.stderr}" if process.stdout or process.stderr else "Command executed with no output."
+        except Exception as e:
+            return f"Execution Error: {str(e)}"
+
+    def _call_ollama(self, persona_key: str, prompt: str, allow_execution: bool = True) -> str:
+        persona = GUILD.get(persona_key, GUILD["SYS"])
+        full_prompt = f"{IDENTITY_LOCK}\n{persona['prompt']}\n\nRequest: {prompt}\n\nResponse:"
+        
+        payload = {"model": OLLAMA_MODEL, "prompt": full_prompt, "stream": False, "options": {"temperature": 0.1}}
+        try:
+            res = requests.post(OLLAMA_URL, json=payload, timeout=120)
+            res.raise_for_status()
+            response_text = res.json().get("response", "").strip()
+            
+            if allow_execution and "```bash" in response_text:
+                cmd = response_text.split("```bash")[1].split("```")[0].strip()
+                console.print(f"[white on blue] ⚙️ EXECUTION LINKED [/white on blue] [bold white] {cmd}[/bold white]")
+                output = self.execute_command(cmd)
+                final_prompt = f"{IDENTITY_LOCK}\n{persona['prompt']}\n\nCommand executed: {cmd}\nOutput: {output}\n\nSummarize the result for the user concisely."
+                return self._call_ollama(persona_key, final_prompt, allow_execution=False)
+            
+            return response_text
+        except Exception as e:
+            return f"Engine Error: {e}"
+
+    def triage(self, prompt: str) -> str:
+        triage_prompt = "Classify this request: SEC, DEV, SYS, or PILOT. Respond with ONLY the code. Request: " + prompt
+        result = self._call_ollama("BRAIN", triage_prompt).strip().upper()
+        for key in GUILD:
+            if key in result: return key
+        return "SYS"
+
+    def run_task(self, prompt: str, deep: bool) -> str:
+        if prompt.lower() in ["hi", "hello", "hey"]:
+            return "Sovereign Shell Online. Awaiting task."
+
+        specialist = self.triage(prompt)
+        spec_info = GUILD[specialist]
+        
+        if not deep:
+            res = self._call_ollama(specialist, prompt)
+            return Panel(res, title=f"[bold {spec_info['color']}] {spec_info['name']}", border_style=spec_info['color'], expand=False)
+
+        console.print(Panel(f"[bold blue]Sovereign Deep Loop Initiated[/bold blue]\n[white]Target Specialist: {spec_info['name']}[/white]", expand=False))
+        
+        with console.status("[cyan]Brain designing strategy...", spinner="dots"):
+            plan = self._call_ollama("BRAIN", prompt, allow_execution=False)
+        console.print(Panel(plan, title="[bold cyan]Strategic Plan[/bold cyan]", border_style="cyan"))
+        
+        with console.status(f"[yellow] {spec_info['name']} executing plan...", spinner="earth"):
+            exec_prompt = f"Plan:\n{plan}\n\nExecute this and provide result."
+            execution_result = self._call_ollama(specialist, exec_prompt)
+        console.print(Panel(execution_result, title=f"[bold {spec_info['color']}] Execution Output", border_style=spec_info['color']))
+        
+        with console.status("[magenta]Manager auditing results...", spinner="clock"):
+            audit_prompt = f"Goal: {prompt}\n\nExecution:\n{execution_result}\n\nVERIFIED or ERRORS."
+            audit_result = self._call_ollama("MANAGER", audit_prompt, allow_execution=False)
+        
+        self.memory.save_action(prompt, plan, audit_result)
+        color = "green" if "VERIFIED" in audit_result.upper() else "red"
+        return Panel(audit_result, title=f"[bold {color}]Audit Result[/bold {color}]", border_style=color, expand=False)
+
+@click.command()
+@click.argument('prompt', required=False)
+@click.option('--deep', is_flag=True, help='Trigger deep verification loop.')
+def main(prompt: Optional[str], deep: bool):
+    engine = NexusEngine()
+    if prompt:
+        result = engine.run_task(prompt, deep)
+        console.print("\n", result)
+    else:
+        console.print(Panel.fit("[bold white]NEXUS SOVEREIGN SHELL ONLINE[/bold white]\n[dim]Memory: Local | Status: Ready[/dim]", border_style="blue"))
+        console.print("[dim]Type 'exit' to quit. Prepend 'deep' for auditing.\n")
+        while True:
+            try:
+                user_input = Prompt.ask("[bold blue]Nexus ➔ [/bold blue]")
+                if user_input.lower() in ["exit", "quit"]: break
+                is_deep = "deep" in user_input.lower()
+                clean_prompt = user_input.replace("deep", "").strip()
+                result = engine.run_task(clean_prompt, is_deep)
+                console.print("\n", result, "\n")
+            except KeyboardInterrupt:
+                break
+
+if __name__ == "__main__":
+    main()
