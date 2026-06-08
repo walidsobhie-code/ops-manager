@@ -1,24 +1,37 @@
+import sys
+import os
+from pathlib import Path
+
+# ── Path bootstrap ──────────────────────────────────────────────────────────────
+# Ensure the project root is in the python path so 'brain' module is found
+_here = os.path.dirname(os.path.abspath(__file__))   # /mount/src/ops-manager/dash
+_root = os.path.abspath(os.path.join(_here, '..'))   # /mount/src/ops-manager
+if _root not in sys.path:
+    sys.path.insert(0, _root)
+
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from brain.db_handler import StoreDB
 from brain.ops_brain import OpsManagerAI
-from brain.analytics import (
-    analyze_store_status, 
-    calculate_7day_baseline, 
-    identify_red_zone_stores, 
-    generate_fleet_summary_prompt,
-    calculate_fleet_kpis,
-    generate_store_forecast,
-    calculate_store_benchmarks,
-    export_fleet_to_excel,
-    export_fleet_to_pdf,
-    optimize_staffing
-)
-import os
-import json
-from datetime import datetime, timedelta
+try:
+    from brain.analytics import (
+        analyze_store_status, 
+        calculate_7day_baseline, 
+        identify_red_zone_stores, 
+        generate_fleet_summary_prompt,
+        calculate_fleet_kpis,
+        generate_store_forecast,
+        calculate_store_benchmarks,
+        export_fleet_to_excel,
+        export_fleet_to_pdf,
+        optimize_staffing
+    )
+except ImportError as e:
+    st.error(f"Critical Error: Could not load analytics engine. {e}")
+    st.stop()
+
 
 # --- Configuration ---
 st.set_page_config(page_title="Sovereign Ops Command Center", layout="wide")
