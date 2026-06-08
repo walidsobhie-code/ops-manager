@@ -122,7 +122,7 @@ baselines = {s: calculate_7day_baseline(df_raw[df_raw['store_id'] == s].to_dict(
              for s in df_raw['store_id'].unique()}
 
 # ─── TOPBAR ─────────────────────────────────────────────────────────────────────
-st a_now = datetime.now().strftime("%a %d %b %Y  ·  %H:%M")
+a_now = datetime.now().strftime("%a %d %b %Y  ·  %H:%M")
 st.markdown(f"""
 <div class="topbar">
     <div style="display:flex; align-items:center; gap:14px;">
